@@ -1,0 +1,37 @@
+bridge:
+  host: 127.0.0.1
+  port: 25580
+  token: "change_me"
+  read-timeout-ms: 15000
+
+log-capture:
+  enabled: true
+  default-wait-ms: 300
+  max-wait-ms: 15000
+  max-lines: 80
+  only-when-empty: false
+  include-console-executor-line: false
+  regex-filter: ""
+  url-first: true
+  file-path: "logs/latest.log"
+
+  # INFO_ONLY / INFO_AND_ABOVE / WARNING_AND_ABOVE
+  level-mode: "INFO_ONLY"
+  related-only: true
+  include-url-lines: true
+  extra-keywords:
+    - "luckperms"
+    - "lp"
+    - "editor"
+
+security:
+  enable-ip-whitelist: false
+  whitelist:
+    - "127.0.0.1"
+    - "::1"
+
+messages:
+  auth-failed: "AUTH_FAILED"
+  forbidden-ip: "FORBIDDEN_IP"
+  bad-request: "BAD_REQUEST"
+  internal-error: "INTERNAL_ERROR"

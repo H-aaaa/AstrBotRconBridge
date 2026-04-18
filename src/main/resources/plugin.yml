@@ -1,0 +1,5 @@
+name: AstrBotRconBridge
+version: '${project.version}'
+main: h_aaa.astrbotrconbridge.AstrBotRconBridge
+authors: [H_aaa]
+description: Fuck your MineCraft-Rcon
