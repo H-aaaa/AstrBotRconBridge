@@ -5,24 +5,14 @@ bridge:
   read-timeout-ms: 15000
 
 log-capture:
+  # Execute as the real console, then return newly appended log lines.
   enabled: true
-  default-wait-ms: 300
+  # Used when the request wait time is negative; increase it for async commands.
+  default-wait-ms: 1000
   max-wait-ms: 15000
   max-lines: 80
-  only-when-empty: false
-  include-console-executor-line: false
-  regex-filter: ""
-  url-first: true
+  # Relative paths are resolved from the server working directory.
   file-path: "logs/latest.log"
-
-  # INFO_ONLY / INFO_AND_ABOVE / WARNING_AND_ABOVE
-  level-mode: "INFO_ONLY"
-  related-only: true
-  include-url-lines: true
-  extra-keywords:
-    - "luckperms"
-    - "lp"
-    - "editor"
 
 security:
   enable-ip-whitelist: false

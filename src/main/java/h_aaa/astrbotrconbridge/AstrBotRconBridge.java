@@ -1,50 +1,43 @@
 package h_aaa.astrbotrconbridge;
 
 import org.bukkit.Bukkit;
-import org.bukkit.command.ConsoleCommandSender;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
-import java.io.RandomAccessFile;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.Charset;
-import java.util.ArrayList;
-import java.util.LinkedHashSet;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
-import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.regex.Pattern;
+import java.util.concurrent.locks.ReentrantLock;
 
 public final class AstrBotRconBridge extends JavaPlugin {
     private final AtomicBoolean running = new AtomicBoolean(false);
+    private final ReentrantLock commandLock = new ReentrantLock(true);
     private ExecutorService acceptPool;
     private ExecutorService workerPool;
     private ServerSocket serverSocket;
-    private LogCaptureManager logCaptureManager;
+    private CommandScheduler commandScheduler;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
         reloadConfig();
 
-        logCaptureManager = new LogCaptureManager(this);
-        if (getConfig().getBoolean("log-capture.enabled", true)) {
-            logCaptureManager.install();
-        }
-
+        commandScheduler = new CommandScheduler(this);
         running.set(true);
         acceptPool = Executors.newSingleThreadExecutor();
         workerPool = Executors.newCachedThreadPool();
@@ -76,9 +69,6 @@ public final class AstrBotRconBridge extends JavaPlugin {
         }
         if (workerPool != null) {
             workerPool.shutdownNow();
-        }
-        if (logCaptureManager != null) {
-            logCaptureManager.uninstall();
         }
         getLogger().info("AstrBot bridge disabled");
     }
@@ -175,68 +165,65 @@ public final class AstrBotRconBridge extends JavaPlugin {
     }
 
     private ExecResult executeRequest(final BridgeRequest request) throws Exception {
-        final ConsoleCommandSender console = Bukkit.getConsoleSender();
-        final BridgeCommandSender sender = new BridgeCommandSender(console);
-
         final int effectiveWait = resolveWaitMs(request.waitMs);
         final boolean captureEnabled = getConfig().getBoolean("log-capture.enabled", true);
-        final boolean captureOnlyWhenEmpty = getConfig().getBoolean("log-capture.only-when-empty", false);
         final int maxLines = Math.max(1, getConfig().getInt("log-capture.max-lines", 80));
-        final boolean urlFirst = getConfig().getBoolean("log-capture.url-first", true);
-        final Pattern filter = LogCaptureManager.compilePattern(getConfig().getString("log-capture.regex-filter", ""));
-        final boolean includeExecutorLine = getConfig().getBoolean("log-capture.include-console-executor-line", false);
-        final String logFilePath = getConfig().getString("log-capture.file-path", "logs/latest.log");
+        String configuredPath = getConfig().getString("log-capture.file-path", "logs/latest.log");
+        final Path logFile = Paths.get(configuredPath == null || configuredPath.trim().isEmpty()
+                ? "logs/latest.log" : configuredPath.trim());
 
-        final Holder<Boolean> okHolder = new Holder<Boolean>(Boolean.FALSE);
-
-        LogCaptureManager.CaptureSession session = null;
-        long logStartOffset = -1L;
-        if (captureEnabled && effectiveWait > 0) {
-            session = logCaptureManager.openSession(request.command, filter, maxLines, urlFirst);
-            logStartOffset = getLogFileLength(logFilePath);
+        // Keep bridge commands and their capture windows from overlapping.
+        if (!commandLock.tryLock(10, TimeUnit.SECONDS)) {
+            return new ExecResult(false, "EXEC_TIMEOUT", "Waiting for another bridge command");
         }
-
-        try {
-            Future<?> future = Bukkit.getScheduler().callSyncMethod(this, new java.util.concurrent.Callable<Object>() {
-                @Override
-                public Object call() {
-                    boolean ok = Bukkit.dispatchCommand(sender, request.command);
-                    okHolder.value = Boolean.valueOf(ok);
-                    return null;
-                }
-            });
+        FutureTask<CommandExecution> task = new FutureTask<>(() -> {
+            if (!running.get()) {
+                throw new IllegalStateException("Bridge is disabled");
+            }
+            // Snapshot on the server thread immediately before dispatch, not while queued.
+            LatestLogCapture capture = captureEnabled ? LatestLogCapture.begin(logFile) : null;
+            ExecResult result;
             try {
-                future.get(10, TimeUnit.SECONDS);
-            } catch (TimeoutException e) {
-                return new ExecResult(false, "EXEC_TIMEOUT", "");
+                boolean accepted = Bukkit.dispatchCommand(Bukkit.getConsoleSender(), request.command);
+                result = new ExecResult(accepted, accepted ? "EXEC_OK" : "EXEC_REJECTED", "");
+            } catch (Exception e) {
+                result = new ExecResult(false,
+                        getConfig().getString("messages.internal-error", "INTERNAL_ERROR"),
+                        e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            }
+            return new CommandExecution(capture, result);
+        });
+        try {
+            commandScheduler.execute(task);
+            CommandExecution execution = task.get(10, TimeUnit.SECONDS);
+            if (execution.capture == null) {
+                return execution.result;
             }
 
-            String directOutput = joinLines(sender.getLines());
-            String captured = "";
-
-            if (session != null && (!captureOnlyWhenEmpty || isBlank(directOutput))) {
-                if (includeExecutorLine) {
-                    getLogger().info("[BridgeExec] " + request.command);
-                }
-                Thread.sleep(effectiveWait);
-                captured = joinLines(session.snapshot());
-                if (isBlank(captured)) {
-                    captured = readNewLogLines(logFilePath, logStartOffset, maxLines, request.command);
-                }
+            // Only the socket worker waits and reads the file; the server thread is free.
+            Thread.sleep(effectiveWait);
+            String output;
+            try {
+                output = execution.capture.readNewContent(maxLines);
+            } catch (IOException e) {
+                output = "Log read failed: " + e.getMessage();
             }
-
-            String finalOutput = mergeOutput(directOutput, captured);
-            boolean success = okHolder.value.booleanValue();
-            return new ExecResult(success, success ? "EXEC_OK" : "EXEC_REJECTED", safe(finalOutput));
+            if (!execution.result.output.isEmpty()) {
+                output = output.isEmpty() ? execution.result.output
+                        : output + '\n' + execution.result.output;
+            }
+            return new ExecResult(execution.result.success, execution.result.code, output);
+        } catch (TimeoutException e) {
+            return new ExecResult(false, "EXEC_TIMEOUT", "");
         } finally {
-            if (session != null) {
-                session.close();
-            }
+            // A command still waiting for a server tick must not execute after timeout.
+            task.cancel(false);
+            commandLock.unlock();
         }
     }
 
     private int resolveWaitMs(int requestWaitMs) {
-        int defaultWait = Math.max(0, getConfig().getInt("log-capture.default-wait-ms", 300));
+        int defaultWait = Math.max(0, getConfig().getInt("log-capture.default-wait-ms", 1000));
         int maxWait = Math.max(0, getConfig().getInt("log-capture.max-wait-ms", 15000));
         int effective = requestWaitMs >= 0 ? requestWaitMs : defaultWait;
         if (effective > maxWait) {
@@ -279,170 +266,6 @@ public final class AstrBotRconBridge extends JavaPlugin {
         writer.flush();
     }
 
-    private String mergeOutput(String directOutput, String capturedOutput) {
-        LinkedHashSet<String> lines = new LinkedHashSet<String>();
-        addLines(lines, directOutput);
-        addLines(lines, capturedOutput);
-
-        StringBuilder sb = new StringBuilder();
-        for (String line : lines) {
-            String trimmed = safe(line).trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            if (sb.length() > 0) {
-                sb.append('\n');
-            }
-            sb.append(trimmed);
-        }
-        return sb.toString();
-    }
-
-    private void addLines(LinkedHashSet<String> out, String raw) {
-        if (raw == null || raw.trim().isEmpty()) {
-            return;
-        }
-        String[] arr = raw.split("\\r?\\n");
-        for (String s : arr) {
-            String t = safe(s).trim();
-            if (!t.isEmpty()) {
-                out.add(t);
-            }
-        }
-    }
-
-    private String joinLines(List<String> lines) {
-        if (lines == null || lines.isEmpty()) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder();
-        for (String line : lines) {
-            String trimmed = safe(line).trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            if (sb.length() > 0) {
-                sb.append('\n');
-            }
-            sb.append(trimmed);
-        }
-        return sb.toString();
-    }
-
-    private long getLogFileLength(String path) {
-        try {
-            File file = resolveLogFile(path);
-            if (file == null || !file.isFile()) {
-                return -1L;
-            }
-            return file.length();
-        } catch (Exception ignored) {
-            return -1L;
-        }
-    }
-
-    private String readNewLogLines(String path, long offset, int maxLines, String command) {
-        if (offset < 0) {
-            return "";
-        }
-        File file = resolveLogFile(path);
-        if (file == null || !file.isFile()) {
-            return "";
-        }
-        LinkedHashSet<String> out = new LinkedHashSet<String>();
-        RandomAccessFile raf = null;
-        try {
-            raf = new RandomAccessFile(file, "r");
-            long start = Math.max(0L, Math.min(offset, raf.length()));
-            raf.seek(start);
-            String line;
-            while ((line = raf.readLine()) != null) {
-                String decoded = decodeRafLine(line).trim();
-                if (decoded.isEmpty() || !looksRelevantLogLine(decoded, command)) {
-                    continue;
-                }
-                out.add(stripLogPrefix(decoded));
-                if (out.size() >= Math.max(1, maxLines)) {
-                    break;
-                }
-            }
-        } catch (Exception ignored) {
-            return "";
-        } finally {
-            if (raf != null) {
-                try {
-                    raf.close();
-                } catch (Exception ignored) {
-                }
-            }
-        }
-        return joinLines(new ArrayList<String>(out));
-    }
-
-    private String decodeRafLine(String line) {
-        try {
-            return new String(line.getBytes("ISO-8859-1"), "UTF-8");
-        } catch (Exception ignored) {
-            return line;
-        }
-    }
-
-    private File resolveLogFile(String path) {
-        String resolved = (path == null || path.trim().isEmpty()) ? "logs/latest.log" : path.trim();
-        File file = new File(resolved);
-        if (file.isAbsolute()) {
-            return file;
-        }
-        File dataFolder = getDataFolder();
-        File pluginsDir = dataFolder == null ? null : dataFolder.getParentFile();
-        File serverRoot = pluginsDir == null ? null : pluginsDir.getParentFile();
-        if (serverRoot == null) {
-            return file;
-        }
-        return new File(serverRoot, resolved);
-    }
-
-    private boolean looksRelevantLogLine(String line, String command) {
-        String lower = safe(line).toLowerCase(Locale.ROOT);
-        if (lower.contains("http://") || lower.contains("https://")) {
-            return true;
-        }
-        if (lower.contains("players online") || lower.contains("there are ")) {
-            return true;
-        }
-        if (command != null) {
-            String[] parts = command.toLowerCase(Locale.ROOT).split("\\s+");
-            for (String p : parts) {
-                if (p.length() >= 2 && lower.contains(p)) {
-                    return true;
-                }
-            }
-        }
-        List<String> extra = getConfig().getStringList("log-capture.extra-keywords");
-        if (extra != null) {
-            for (String keyword : extra) {
-                if (keyword != null) {
-                    String k = keyword.trim().toLowerCase(Locale.ROOT);
-                    if (k.length() >= 2 && lower.contains(k)) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    private String stripLogPrefix(String line) {
-        String noPrefix = safe(line).replaceFirst("^\\[[^\\]]+\\]\\s*", "");
-        noPrefix = noPrefix.replaceFirst("^\\[[^\\]]+/INFO\\]:\\s*", "");
-        noPrefix = noPrefix.replaceFirst("^INFO\\]:\\s*", "");
-        return noPrefix.trim();
-    }
-
-    private boolean isBlank(String s) {
-        return s == null || s.trim().isEmpty();
-    }
-
     private String safe(String value) {
         return value == null ? "" : value;
     }
@@ -451,10 +274,13 @@ public final class AstrBotRconBridge extends JavaPlugin {
         return java.util.Base64.getEncoder().encodeToString(value.getBytes(Charset.forName("UTF-8")));
     }
 
-    private static final class Holder<T> {
-        private T value;
-        private Holder(T value) {
-            this.value = value;
+    private static final class CommandExecution {
+        private final LatestLogCapture capture;
+        private final ExecResult result;
+
+        private CommandExecution(LatestLogCapture capture, ExecResult result) {
+            this.capture = capture;
+            this.result = result;
         }
     }
 
