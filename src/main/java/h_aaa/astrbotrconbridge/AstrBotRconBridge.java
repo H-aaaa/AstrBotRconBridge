@@ -30,12 +30,14 @@ public final class AstrBotRconBridge extends JavaPlugin {
     private ExecutorService acceptPool;
     private ExecutorService workerPool;
     private ServerSocket serverSocket;
+    private CommandScheduler commandScheduler;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
         reloadConfig();
 
+        commandScheduler = new CommandScheduler(this);
         running.set(true);
         acceptPool = Executors.newSingleThreadExecutor();
         workerPool = Executors.newCachedThreadPool();
@@ -192,7 +194,7 @@ public final class AstrBotRconBridge extends JavaPlugin {
             return new CommandExecution(capture, result);
         });
         try {
-            Bukkit.getScheduler().runTask(this, task);
+            commandScheduler.execute(task);
             CommandExecution execution = task.get(10, TimeUnit.SECONDS);
             if (execution.capture == null) {
                 return execution.result;
